@@ -70,8 +70,7 @@ h3 {
 }
 
 h1 {
-  margin-top: 12px;
-  font-size: clamp(2.8rem, 5vw, 4.8rem);
+  font-size: clamp(2.2rem, 4vw, 3.8rem);
   letter-spacing: -0.05em;
 }
 
@@ -92,6 +91,7 @@ a {
 }
 
 button,
-input {
+input,
+textarea {
   font: inherit;
 }

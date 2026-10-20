@@ -15,6 +15,13 @@ dist-ssr
 .env
 storage/uploads/*
 !storage/uploads/.gitkeep
+storage/knowledge-base/*.pages.json
+storage/release-notes/*.pages.json
+storage/updated-manuals/*
+!storage/updated-manuals/.gitkeep
+storage/updated-release-notes/*
+!storage/updated-release-notes/.gitkeep
+storage/agent-cache/*
 
 # Editor directories and files
 .vscode/*

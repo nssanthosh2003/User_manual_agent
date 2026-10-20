@@ -11,7 +11,25 @@ type ManualFile = {
 
 type WorkspaceState = {
   knowledgeBaseManuals: ManualFile[]
+  knowledgeBaseReleaseNotes: ManualFile[]
   updatedManuals: ManualFile[]
+  updatedReleaseNotes: ManualFile[]
+}
+
+type RetrievedChunk = {
+  id: string
+  pageNumbers: number[]
+  sectionHeadings: string[]
+  preview: string
+}
+
+type AppliedEdit = {
+  type: 'replace' | 'insert_after'
+  pageNumber: number
+  sectionHeading: string
+  oldText: string
+  newText: string
+  reason: string
 }
 
 type ProcessResult = {
@@ -25,26 +43,28 @@ type ProcessResult = {
     extractedText: string[]
     impacts: string[]
   }
-  retrievedChunks: Array<{
-    id: string
-    paragraphIndices: number[]
-    preview: string
-  }>
-  edits: Array<{
-    type: 'replace' | 'insert_after'
-    paragraphIndex: number
-    reason: string
-  }>
+  retrievedChunks: RetrievedChunk[]
+  edits: AppliedEdit[]
+  releaseNotesOutputFileName: string | null
+  releaseNotesOutputUrl: string | null
+  releaseNotesRetrievedChunks: RetrievedChunk[]
+  releaseNotesEdits: AppliedEdit[]
+  indexUpdateRequested: boolean
 }
 
 function App() {
   const [workspaceState, setWorkspaceState] = useState<WorkspaceState>({
     knowledgeBaseManuals: [],
+    knowledgeBaseReleaseNotes: [],
     updatedManuals: [],
+    updatedReleaseNotes: [],
   })
   const [storyFile, setStoryFile] = useState<File | null>(null)
   const [screenshotFile, setScreenshotFile] = useState<File | null>(null)
+  const [screenshotDescription, setScreenshotDescription] = useState('')
+  const [updateIndex, setUpdateIndex] = useState(true)
   const [isSubmitting, setIsSubmitting] = useState(false)
+  const [deletingManual, setDeletingManual] = useState('')
   const [errorMessage, setErrorMessage] = useState('')
   const [result, setResult] = useState<ProcessResult | null>(null)
   const deferredResult = useDeferredValue(result)
@@ -59,7 +79,12 @@ function App() {
     const payload = (await response.json()) as WorkspaceState
 
     startTransition(() => {
-      setWorkspaceState(payload)
+      setWorkspaceState({
+        knowledgeBaseManuals: payload.knowledgeBaseManuals ?? [],
+        knowledgeBaseReleaseNotes: payload.knowledgeBaseReleaseNotes ?? [],
+        updatedManuals: payload.updatedManuals ?? [],
+        updatedReleaseNotes: payload.updatedReleaseNotes ?? [],
+      })
     })
   }
 
@@ -80,6 +105,8 @@ function App() {
     const formData = new FormData()
     formData.append('userStory', storyFile)
     formData.append('screenshot', screenshotFile)
+    formData.append('screenshotDescription', screenshotDescription)
+    formData.append('updateIndex', String(updateIndex))
 
     setIsSubmitting(true)
     setErrorMessage('')
@@ -105,31 +132,40 @@ function App() {
     }
   }
 
+  async function deleteDocument(manual: ManualFile, documentType: 'manual' | 'release-notes') {
+    if (!window.confirm(`Delete "${manual.name}" permanently?`)) {
+      return
+    }
+
+    setDeletingManual(manual.name)
+    setErrorMessage('')
+    try {
+      const route = documentType === 'manual' ? 'manuals' : 'release-notes'
+      const response = await fetch(`/api/${route}/${encodeURIComponent(manual.name)}`, {
+        method: 'DELETE',
+      })
+      if (!response.ok) {
+        const payload = (await response.json()) as { error?: string }
+        throw new Error(payload.error ?? 'Unable to delete the generated document.')
+      }
+      if (
+        result?.outputFileName === manual.name ||
+        result?.releaseNotesOutputFileName === manual.name
+      ) {
+        setResult(null)
+      }
+      await loadWorkspaceState()
+    } catch (error) {
+      setErrorMessage(error instanceof Error ? error.message : 'Unable to delete the generated document.')
+    } finally {
+      setDeletingManual('')
+    }
+  }
+
   return (
     <main className="shell">
       <section className="hero-panel">
-        <p className="eyebrow">Agentic workflow + RAG manual updater</p>
         <h1>TCS AgentAssist Manual Updater</h1>
-        <p className="hero-copy">
-          Keep the approved DOCX manual fixed as the knowledge base, submit a user story file and a
-          screenshot, and generate an updated manual in a separate output folder without disturbing
-          the original source manual.
-        </p>
-
-        <div className="hero-metrics">
-          <article>
-            <span>Vision model</span>
-            <strong>GPT-5</strong>
-          </article>
-          <article>
-            <span>Knowledge source</span>
-            <strong>{workspaceState.knowledgeBaseManuals.length || 0} fixed manuals</strong>
-          </article>
-          <article>
-            <span>Generated outputs</span>
-            <strong>{workspaceState.updatedManuals.length || 0} manuals</strong>
-          </article>
-        </div>
       </section>
 
       <section className="grid-layout">
@@ -162,25 +198,48 @@ function App() {
             <small>{screenshotFile ? screenshotFile.name : 'Upload the screenshot that contains the UI change.'}</small>
           </label>
 
+          <label className="input-card">
+            <span>Screenshot change description</span>
+            <textarea
+              value={screenshotDescription}
+              onChange={(event) => setScreenshotDescription(event.target.value)}
+              placeholder="Describe what changed in the screenshot, what the new controls do, and any wording that should appear in the manual."
+              rows={4}
+            />
+            <small>This context is combined with the screenshot analysis to produce a precise update.</small>
+          </label>
+
+          <label className="index-option">
+            <input
+              type="checkbox"
+              checked={updateIndex}
+              onChange={(event) => setUpdateIndex(event.target.checked)}
+            />
+            <span>
+              <strong>Update document indexes</strong>
+              <small>Refresh available tables of contents and page references before the generated documents are saved.</small>
+            </span>
+          </label>
+
           <div className="workflow-strip">
             <article>
               <strong>1</strong>
-              <p>Extract story text and analyze the screenshot with GPT-5.</p>
+              <p>Analyze inputs.</p>
             </article>
             <article>
               <strong>2</strong>
-              <p>Retrieve only the relevant manual paragraphs through embeddings-based RAG.</p>
+              <p>Find relevant sections.</p>
             </article>
             <article>
               <strong>3</strong>
-              <p>Apply targeted DOCX edits and save the updated manual in the output section.</p>
+              <p>Generate both documents.</p>
             </article>
           </div>
 
           {errorMessage ? <p className="error-banner">{errorMessage}</p> : null}
 
           <button className="submit-button" type="submit" disabled={isSubmitting}>
-            {isSubmitting ? 'Updating manual...' : 'Generate updated manual'}
+            {isSubmitting ? 'Updating documents...' : 'Generate updated documents'}
           </button>
         </form>
 
@@ -209,6 +268,34 @@ function App() {
               <p className="empty-state">No DOCX knowledge base manual is available yet.</p>
             )}
           </div>
+
+          <div className="knowledge-group">
+            <div className="panel-heading compact-heading">
+              <div>
+                <p className="section-tag">Fixed knowledge base</p>
+                <h2>Source release notes</h2>
+              </div>
+            </div>
+            <div className="manual-list compact">
+              {workspaceState.knowledgeBaseReleaseNotes.length ? (
+                workspaceState.knowledgeBaseReleaseNotes.map((document) => (
+                  <article className="manual-card" key={document.url}>
+                    <div>
+                      <h3>{document.name}</h3>
+                      <p>{document.sizeKb} KB</p>
+                    </div>
+                    <a href={document.url} target="_blank" rel="noreferrer">
+                      Open source release notes
+                    </a>
+                  </article>
+                ))
+              ) : (
+                <p className="empty-state">
+                  Add a DOCX release notes file to storage/release-notes.
+                </p>
+              )}
+            </div>
+          </div>
         </aside>
       </section>
 
@@ -234,19 +321,42 @@ function App() {
                 </a>
               </article>
 
+              {deferredResult.releaseNotesOutputFileName && deferredResult.releaseNotesOutputUrl ? (
+                <article className="result-summary">
+                  <div>
+                    <span className="result-label">Generated release notes</span>
+                    <h3>{deferredResult.releaseNotesOutputFileName}</h3>
+                    <p>{new Date(deferredResult.generatedAt).toLocaleString()}</p>
+                  </div>
+                  <a
+                    className="download-link"
+                    href={deferredResult.releaseNotesOutputUrl}
+                    target="_blank"
+                    rel="noreferrer"
+                  >
+                    Download updated release notes
+                  </a>
+                </article>
+              ) : (
+                <article className="result-card">
+                  <h3>Release notes not generated</h3>
+                  <p>Add a DOCX file to storage/release-notes, then run the workflow again.</p>
+                </article>
+              )}
+
               <article className="result-card">
-                <h3>User story excerpt</h3>
+                <h3>Change request</h3>
                 <p>{deferredResult.storyExcerpt}</p>
               </article>
 
               <article className="result-card">
                 <h3>Screenshot summary</h3>
                 <p>{deferredResult.screenshotSummary.summary}</p>
-                <div className="tag-list">
+                <ul className="summary-list">
                   {deferredResult.screenshotSummary.visibleChanges.map((item) => (
-                    <span key={item}>{item}</span>
+                    <li key={item}>{item}</li>
                   ))}
-                </div>
+                </ul>
               </article>
 
               <article className="result-card">
@@ -254,7 +364,10 @@ function App() {
                 <div className="chunk-list">
                   {deferredResult.retrievedChunks.map((chunk) => (
                     <div key={chunk.id} className="chunk-card">
-                      <span>Paragraphs {chunk.paragraphIndices.join(', ')}</span>
+                      <div className="location-row">
+                        <strong>{chunk.pageNumbers.length === 1 ? `Word page ${chunk.pageNumbers[0]}` : `Word pages ${chunk.pageNumbers.join(', ')}`}</strong>
+                        <span>Section: {chunk.sectionHeadings.join(' · ')}</span>
+                      </div>
                       <p>{chunk.preview}</p>
                     </div>
                   ))}
@@ -262,16 +375,84 @@ function App() {
               </article>
 
               <article className="result-card">
-                <h3>Applied edits</h3>
+                <h3>Applied manual edits</h3>
                 <div className="edit-list">
                   {deferredResult.edits.map((edit, index) => (
-                    <div key={`${edit.paragraphIndex}-${index}`} className="edit-card">
-                      <strong>{edit.type === 'replace' ? 'Replace' : 'Insert after'} paragraph {edit.paragraphIndex}</strong>
-                      <p>{edit.reason}</p>
+                    <div key={`${edit.pageNumber}-${edit.sectionHeading}-${index}`} className="edit-card">
+                      <div className="location-row">
+                        <strong>Word page {edit.pageNumber}</strong>
+                        <span>Section: {edit.sectionHeading}</span>
+                      </div>
+                      <p className="edit-reason">{edit.reason}</p>
+                      <div className="comparison-grid">
+                        <div className="comparison-old">
+                          <span>{edit.type === 'replace' ? 'Old text' : 'Insert after'}</span>
+                          <p>{edit.oldText || `Existing content in ${edit.sectionHeading}`}</p>
+                        </div>
+                        <div className="comparison-new">
+                          <span>New text</span>
+                          <p>{edit.newText}</p>
+                        </div>
+                      </div>
                     </div>
                   ))}
                 </div>
+                {deferredResult.indexUpdateRequested ? (
+                  <p className="index-status">The manual index was refreshed before the document was saved.</p>
+                ) : null}
               </article>
+
+              {deferredResult.releaseNotesOutputFileName ? (
+                <>
+                  <article className="result-card">
+                    <h3>Retrieved release notes slices</h3>
+                    <div className="chunk-list">
+                      {deferredResult.releaseNotesRetrievedChunks.map((chunk) => (
+                        <div key={chunk.id} className="chunk-card">
+                          <div className="location-row">
+                            <strong>
+                              {chunk.pageNumbers.length === 1
+                                ? `Word page ${chunk.pageNumbers[0]}`
+                                : `Word pages ${chunk.pageNumbers.join(', ')}`}
+                            </strong>
+                            <span>Section: {chunk.sectionHeadings.join(' · ')}</span>
+                          </div>
+                          <p>{chunk.preview}</p>
+                        </div>
+                      ))}
+                    </div>
+                  </article>
+
+                  <article className="result-card">
+                    <h3>Applied release notes edits</h3>
+                    <div className="edit-list">
+                      {deferredResult.releaseNotesEdits.length ? (
+                        deferredResult.releaseNotesEdits.map((edit, index) => (
+                          <div key={`${edit.pageNumber}-${edit.sectionHeading}-${index}`} className="edit-card">
+                            <div className="location-row">
+                              <strong>Word page {edit.pageNumber}</strong>
+                              <span>Section: {edit.sectionHeading}</span>
+                            </div>
+                            <p className="edit-reason">{edit.reason}</p>
+                            <div className="comparison-grid">
+                              <div className="comparison-old">
+                                <span>{edit.type === 'replace' ? 'Old text' : 'Insert after'}</span>
+                                <p>{edit.oldText || `Existing content in ${edit.sectionHeading}`}</p>
+                              </div>
+                              <div className="comparison-new">
+                                <span>New text</span>
+                                <p>{edit.newText}</p>
+                              </div>
+                            </div>
+                          </div>
+                        ))
+                      ) : (
+                        <p className="empty-state">No release notes text change was required.</p>
+                      )}
+                    </div>
+                  </article>
+                </>
+              ) : null}
             </div>
           ) : (
             <p className="empty-state">
@@ -299,14 +480,62 @@ function App() {
                       {manual.sizeKb} KB · {new Date(manual.createdAt).toLocaleString()}
                     </p>
                   </div>
-                  <a href={manual.url} target="_blank" rel="noreferrer">
-                    Open output
-                  </a>
+                  <div className="manual-actions">
+                    <a href={manual.url} target="_blank" rel="noreferrer">
+                      Open output
+                    </a>
+                    <button
+                      className="delete-button"
+                      type="button"
+                      onClick={() => deleteDocument(manual, 'manual')}
+                      disabled={deletingManual === manual.name}
+                    >
+                      {deletingManual === manual.name ? 'Deleting…' : 'Delete'}
+                    </button>
+                  </div>
                 </article>
               ))
             ) : (
               <p className="empty-state">The updated-manuals folder will populate after the first run.</p>
             )}
+          </div>
+
+          <div className="knowledge-group output-group">
+            <div className="panel-heading compact-heading">
+              <div>
+                <p className="section-tag">Updated release notes</p>
+                <h2>Release notes outputs</h2>
+              </div>
+            </div>
+            <div className="manual-list">
+              {workspaceState.updatedReleaseNotes.length ? (
+                workspaceState.updatedReleaseNotes.map((document) => (
+                  <article className="manual-card" key={document.url}>
+                    <div>
+                      <h3>{document.name}</h3>
+                      <p>
+                        {document.sizeKb} KB · {new Date(document.createdAt).toLocaleString()}
+                      </p>
+                    </div>
+                    <div className="manual-actions">
+                      <a href={document.url} target="_blank" rel="noreferrer">
+                        Open output
+                      </a>
+                      <button
+                        className="delete-button"
+                        type="button"
+                        onClick={() => deleteDocument(document, 'release-notes')}
+                        disabled={deletingManual === document.name}
+                      >
+                        {deletingManual === document.name ? 'Deleting…' : 'Delete'}
+                      </button>
+                    </div>
+                  </article>
+                ))
+              ) : (
+                <p className="empty-state">Updated release notes will appear after the first run.</p>
+              )}
+            </div>
           </div>
         </section>
       </section>
