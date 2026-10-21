@@ -303,18 +303,21 @@ async function extractParagraphsFromDocx(filePath: string): Promise<ParagraphRec
       pageNumber = renderedPage
     }
 
+    const hasImage = paragraphNode.getElementsByTagName('w:drawing').length > 0
+
     return {
       index,
       text,
       styleId,
       pageNumber,
       sectionHeading,
+      hasImage,
     }
   })
 }
 
 function buildChunks(paragraphs: ParagraphRecord[]): ManualChunk[] {
-  const nonEmpty = paragraphs.filter((paragraph) => paragraph.text)
+  const nonEmpty = paragraphs.filter((paragraph) => paragraph.text || paragraph.hasImage)
   const chunks: ManualChunk[] = []
   let slice: ParagraphRecord[] = []
 
@@ -561,12 +564,163 @@ try {
   }
 }
 
+function registerImageInDocx(
+  zip: PizZip,
+  imageBuffer: Buffer,
+  originalFilename: string,
+) {
+  const extension = path.extname(originalFilename).toLowerCase().replace('.', '') || 'png'
+  const contentType = extension === 'jpg' || extension === 'jpeg' ? 'image/jpeg' : 'image/png'
+
+  // 1. Update [Content_Types].xml if the extension is not present
+  const contentTypesXml = zip.file('[Content_Types].xml')?.asText()
+  if (contentTypesXml) {
+    const ctDoc = parser.parseFromString(normalizeDocumentXml(contentTypesXml), 'application/xml')
+    const defaults = Array.from(ctDoc.getElementsByTagName('Default'))
+    const exists = defaults.some(
+      (node) => node.getAttribute('Extension')?.toLowerCase() === extension,
+    )
+    if (!exists) {
+      const newDefault = ctDoc.createElement('Default')
+      newDefault.setAttribute('Extension', extension)
+      newDefault.setAttribute('ContentType', contentType)
+      ctDoc.documentElement?.appendChild(newDefault)
+      zip.file('[Content_Types].xml', serializer.serializeToString(ctDoc))
+    }
+  }
+
+  // 2. Determine unique image name in word/media/
+  const existingFiles = Object.keys(zip.files)
+  let imageIndex = 1
+  while (existingFiles.includes(`word/media/image_inst_${imageIndex}.${extension}`)) {
+    imageIndex++
+  }
+  const mediaFileName = `image_inst_${imageIndex}.${extension}`
+  const mediaPath = `word/media/${mediaFileName}`
+  zip.file(mediaPath, imageBuffer)
+
+  // 3. Register relationship in word/_rels/document.xml.rels
+  const relsXml = zip.file('word/_rels/document.xml.rels')?.asText()
+  if (!relsXml) {
+    throw new Error('Could not find word/_rels/document.xml.rels in manual DOCX')
+  }
+
+  const relsDoc = parser.parseFromString(normalizeDocumentXml(relsXml), 'application/xml')
+  const relationships = Array.from(relsDoc.getElementsByTagName('Relationship'))
+  let maxRId = 1
+  for (const rel of relationships) {
+    const id = rel.getAttribute('Id') ?? ''
+    const match = id.match(/rId(\d+)/i)
+    if (match) {
+      const num = parseInt(match[1], 10)
+      if (num >= maxRId) maxRId = num + 1
+    }
+  }
+  const relId = `rId${maxRId}`
+
+  const newRel = relsDoc.createElement('Relationship')
+  newRel.setAttribute('Id', relId)
+  newRel.setAttribute(
+    'Type',
+    'http://schemas.openxmlformats.org/officeDocument/2006/relationships/image',
+  )
+  newRel.setAttribute('Target', `media/${mediaFileName}`)
+  relsDoc.documentElement?.appendChild(newRel)
+  zip.file('word/_rels/document.xml.rels', serializer.serializeToString(relsDoc))
+
+  return relId
+}
+
+function createImageParagraph(
+  document: any,
+  relId: string,
+  caption?: string,
+) {
+  const paragraph = document.createElement('w:p')
+
+  // Center alignment
+  const pPr = document.createElement('w:pPr')
+  const jc = document.createElement('w:jc')
+  jc.setAttribute('w:val', 'center')
+  pPr.appendChild(jc)
+  paragraph.appendChild(pPr)
+
+  // Drawing run
+  const run = document.createElement('w:r')
+  const drawing = document.createElement('w:drawing')
+
+  // Standard inline drawing (approx 5.5 inches wide, 3.5 inches tall in EMUs: 1 inch = 914400 EMUs)
+  const cx = 5029200
+  const cy = 3200400
+  const docPrId = Math.floor(Math.random() * 1000000) + 1000
+
+  const inlineXml = `<wp:inline xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing" distT="0" distB="0" distL="0" distR="0">
+    <wp:extent cx="${cx}" cy="${cy}"/>
+    <wp:effectExtent l="0" t="0" r="0" b="0"/>
+    <wp:docPr id="${docPrId}" name="InstructionPicture"/>
+    <wp:cNvGraphicFramePr>
+      <a:graphicFrameLocks xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" noChangeAspect="1"/>
+    </wp:cNvGraphicFramePr>
+    <a:graphic xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">
+      <a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/picture">
+        <pic:pic xmlns:pic="http://schemas.openxmlformats.org/drawingml/2006/picture">
+          <pic:nvPicPr>
+            <pic:cNvPr id="${docPrId}" name="InstructionImage"/>
+            <pic:cNvPicPr/>
+          </pic:nvPicPr>
+          <pic:blipFill>
+            <a:blip xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" r:embed="${relId}"/>
+            <a:stretch><a:fillRect/></a:stretch>
+          </pic:blipFill>
+          <pic:spPr>
+            <a:xfrm><a:off x="0" y="0"/><a:ext cx="${cx}" cy="${cy}"/></a:xfrm>
+            <a:prstGeom prst="rect"><a:avLst/></a:prstGeom>
+          </pic:spPr>
+        </pic:pic>
+      </a:graphicData>
+    </a:graphic>
+  </wp:inline>`
+
+  const inlineDoc = parser.parseFromString(inlineXml, 'application/xml')
+  drawing.appendChild(document.importNode(inlineDoc.documentElement, true))
+  run.appendChild(drawing)
+  paragraph.appendChild(run)
+
+  // Optional caption paragraph
+  if (caption && caption.trim()) {
+    const captionP = document.createElement('w:p')
+    const capPPr = document.createElement('w:pPr')
+    const capJc = document.createElement('w:jc')
+    capJc.setAttribute('w:val', 'center')
+    capPPr.appendChild(capJc)
+    captionP.appendChild(capPPr)
+
+    const capRun = document.createElement('w:r')
+    const capRPr = document.createElement('w:rPr')
+    const italic = document.createElement('w:i')
+    capRPr.appendChild(italic)
+    capRun.appendChild(capRPr)
+
+    const capText = document.createElement('w:t')
+    capText.setAttribute('xml:space', 'preserve')
+    capText.appendChild(document.createTextNode(caption.trim()))
+    capRun.appendChild(capText)
+    captionP.appendChild(capRun)
+
+    return [paragraph, captionP]
+  }
+
+  return [paragraph]
+}
+
 async function applyEditsToDocx(
   baseManualPath: string,
   edits: EditOperation[],
   outputPath: string,
   updateIndex: boolean,
   preserveRunFormatting = false,
+  attachedImagesMap: Map<string, { buffer: Buffer; originalFilename: string }> = new Map(),
+  screenshotBuffer?: { buffer: Buffer; originalFilename: string },
 ) {
   const fileBuffer = await fs.readFile(baseManualPath)
   const zip = new PizZip(fileBuffer)
@@ -588,16 +742,84 @@ async function applyEditsToDocx(
 
     if (edit.type === 'insert_after') {
       const template = findBodyParagraphTemplate(paragraphNodes, edit.paragraphIndex, target)
-      const paragraph = createBodyParagraph(
-        template,
-        edit.replacementText,
-        preserveRunFormatting,
-      )
-      target.parentNode?.insertBefore(paragraph, target.nextSibling)
+      let insertPoint: any = target
+
+      if (edit.replacementText) {
+        const paragraph = createBodyParagraph(
+          template,
+          edit.replacementText,
+          preserveRunFormatting,
+        )
+        target.parentNode?.insertBefore(paragraph, insertPoint.nextSibling)
+        insertPoint = paragraph
+      }
+
+      // Check if this edit operation has an attached image to insert
+      if (edit.imageAttachment && attachedImagesMap.size > 0) {
+        const matchingImgKey = Array.from(attachedImagesMap.keys()).find(
+          (k) =>
+            k.toLowerCase() === edit.imageAttachment!.toLowerCase() ||
+            k.toLowerCase().includes(edit.imageAttachment!.toLowerCase()) ||
+            edit.imageAttachment!.toLowerCase().includes(k.toLowerCase()),
+        )
+        const imgData = matchingImgKey ? attachedImagesMap.get(matchingImgKey) : undefined
+        if (imgData) {
+          const relId = registerImageInDocx(zip, imgData.buffer, imgData.originalFilename)
+          const imgParagraphs = createImageParagraph(document, relId, edit.imageCaption)
+          for (const imgP of imgParagraphs) {
+            target.parentNode?.insertBefore(imgP, insertPoint.nextSibling)
+            insertPoint = imgP
+          }
+        }
+      }
       continue
     }
 
-    replaceParagraphText(target, edit.replacementText, preserveRunFormatting)
+    // replace
+    if (edit.replacementText) {
+      replaceParagraphText(target, edit.replacementText, preserveRunFormatting)
+    }
+
+    // Replace existing screenshot/image in manual if requested
+    if (edit.replaceImage && screenshotBuffer) {
+      const blipNodes = Array.from(target.getElementsByTagName('a:blip'))
+      if (blipNodes.length > 0) {
+        // Paragraph already has an existing image drawing — register the new screenshot and update r:embed
+        const relId = registerImageInDocx(zip, screenshotBuffer.buffer, screenshotBuffer.originalFilename)
+        for (const blip of blipNodes) {
+          blip.setAttribute('r:embed', relId)
+        }
+      } else {
+        // If the target paragraph didn't have drawing XML itself, insert the screenshot right after it
+        const relId = registerImageInDocx(zip, screenshotBuffer.buffer, screenshotBuffer.originalFilename)
+        const imgParagraphs = createImageParagraph(document, relId, edit.imageCaption)
+        let insertPoint: any = target
+        for (const imgP of imgParagraphs) {
+          target.parentNode?.insertBefore(imgP, insertPoint.nextSibling)
+          insertPoint = imgP
+        }
+      }
+    }
+
+    // If replace also specified an image attachment
+    if (edit.imageAttachment && attachedImagesMap.size > 0) {
+      const matchingImgKey = Array.from(attachedImagesMap.keys()).find(
+        (k) =>
+          k.toLowerCase() === edit.imageAttachment!.toLowerCase() ||
+          k.toLowerCase().includes(edit.imageAttachment!.toLowerCase()) ||
+          edit.imageAttachment!.toLowerCase().includes(k.toLowerCase()),
+      )
+      const imgData = matchingImgKey ? attachedImagesMap.get(matchingImgKey) : undefined
+      if (imgData) {
+        const relId = registerImageInDocx(zip, imgData.buffer, imgData.originalFilename)
+        const imgParagraphs = createImageParagraph(document, relId, edit.imageCaption)
+        let insertPoint: any = target
+        for (const imgP of imgParagraphs) {
+          target.parentNode?.insertBefore(imgP, insertPoint.nextSibling)
+          insertPoint = imgP
+        }
+      }
+    }
   }
 
   zip.file('word/document.xml', serializer.serializeToString(document))
@@ -693,23 +915,43 @@ app.post(
   upload.fields([
     { name: 'userStory', maxCount: 1 },
     { name: 'screenshot', maxCount: 1 },
+    { name: 'instructionImages', maxCount: 10 },
   ]),
   async (request, response, next) => {
     const files = request.files as
       | {
           userStory?: Express.Multer.File[]
           screenshot?: Express.Multer.File[]
+          instructionImages?: Express.Multer.File[]
         }
       | undefined
 
     const userStoryFile = files?.userStory?.[0]
     const screenshotFile = files?.screenshot?.[0]
+    const instructionImageFiles = files?.instructionImages ?? []
     const screenshotDescription = String(request.body.screenshotDescription ?? '').trim()
+    const additionalInstructions = String(request.body.additionalInstructions ?? '').trim()
+    const replaceScreenshotInManual = request.body.replaceScreenshotInManual === 'true'
     const updateIndex = request.body.updateIndex === 'true'
 
     if (!userStoryFile || !screenshotFile) {
       response.status(400).json({ error: 'Upload both a user story file and a screenshot.' })
       return
+    }
+
+    const screenshotBuffer = {
+      buffer: await fs.readFile(screenshotFile.path),
+      originalFilename: screenshotFile.originalname,
+    }
+
+    // Build memory map of attached instruction images
+    const attachedImagesMap = new Map<string, { buffer: Buffer; originalFilename: string }>()
+    for (const imgFile of instructionImageFiles) {
+      const buffer = await fs.readFile(imgFile.path)
+      attachedImagesMap.set(imgFile.originalname, {
+        buffer,
+        originalFilename: imgFile.originalname,
+      })
     }
 
     try {
@@ -730,18 +972,43 @@ app.post(
       )
       const paragraphs = await extractParagraphsFromDocx(baseManual.path)
       const chunks = buildChunks(paragraphs)
-      const retrievalQuery = [storyText, screenshotDescription, screenshotSummary.summary, ...screenshotSummary.visibleChanges, ...screenshotSummary.impacts]
+      const retrievalQuery = [
+        storyText,
+        screenshotDescription,
+        additionalInstructions,
+        ...instructionImageFiles.map((f) => f.originalname),
+        screenshotSummary.summary,
+        ...screenshotSummary.visibleChanges,
+        ...screenshotSummary.impacts,
+      ]
         .join('\n')
         .slice(0, 12000)
       const retrievedChunks = await retrieveRelevantChunks(client, retrievalQuery, chunks)
       const paragraphIndices = new Set(retrievedChunks.flatMap((chunk) => chunk.paragraphIndices))
       const relevantParagraphs = paragraphs.filter((paragraph) => paragraphIndices.has(paragraph.index))
-      const edits = await planEdits(client, storyText, screenshotSummary, relevantParagraphs)
+      const attachedImageNames = instructionImageFiles.map((f) => f.originalname)
+      const edits = await planEdits(
+        client,
+        storyText,
+        screenshotSummary,
+        relevantParagraphs,
+        additionalInstructions,
+        attachedImageNames,
+        replaceScreenshotInManual,
+      )
       const outputFileName = buildOutputFileName(baseManual.name)
       const outputPath = path.join(updatedManualsDir, outputFileName)
 
       if (edits.length > 0 || updateIndex) {
-        await applyEditsToDocx(baseManual.path, edits, outputPath, updateIndex)
+        await applyEditsToDocx(
+          baseManual.path,
+          edits,
+          outputPath,
+          updateIndex,
+          false,
+          attachedImagesMap,
+          screenshotBuffer,
+        )
       } else {
         await fs.copyFile(baseManual.path, outputPath)
       }
@@ -774,6 +1041,7 @@ app.post(
           storyText,
           screenshotSummary,
           relevantReleaseNotesParagraphs,
+          additionalInstructions,
         )
         releaseNotesOutputFileName = buildOutputFileName(releaseNotesSource.name)
         const releaseNotesOutputPath = path.join(
@@ -800,6 +1068,9 @@ app.post(
         outputUrl: `/downloads/updated-manuals/${encodeURIComponent(outputFileName)}`,
         generatedAt: new Date().toISOString(),
         storyExcerpt: trimForPreview(storyText, 260),
+        additionalInstructions: additionalInstructions || null,
+        attachedImageCount: instructionImageFiles.length,
+        replaceScreenshotRequested: replaceScreenshotInManual,
         screenshotSummary,
         indexUpdateRequested: updateIndex,
         retrievedChunks: retrievedChunks.map((chunk) => ({
@@ -808,7 +1079,7 @@ app.post(
           sectionHeadings: chunk.sectionHeadings,
           preview: trimForPreview(chunk.content),
         })),
-        edits: edits.map(({ type, paragraphIndex, replacementText, reason }) => {
+        edits: edits.map(({ type, paragraphIndex, replacementText, reason, imageAttachment, imageCaption, replaceImage }) => {
           const target = paragraphs[paragraphIndex]
           return {
             type,
@@ -817,6 +1088,9 @@ app.post(
             oldText: target?.text ?? '',
             newText: replacementText,
             reason,
+            imageAttachment,
+            imageCaption,
+            replaceImage,
           }
         }),
         releaseNotesOutputFileName,
@@ -844,7 +1118,11 @@ app.post(
     } catch (error) {
       next(error)
     } finally {
-      await cleanupFiles([userStoryFile.path, screenshotFile.path])
+      await cleanupFiles([
+        userStoryFile.path,
+        screenshotFile.path,
+        ...instructionImageFiles.map((f) => f.path),
+      ])
     }
   },
 )

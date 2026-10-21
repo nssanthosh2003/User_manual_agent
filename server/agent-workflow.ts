@@ -16,6 +16,7 @@ export type ParagraphRecord = {
   styleId: string | null
   pageNumber: number
   sectionHeading: string
+  hasImage?: boolean
 }
 
 /** A locally retrieved group of related manual paragraphs. */
@@ -41,6 +42,9 @@ export type EditOperation = {
   paragraphIndex: number
   replacementText: string
   reason: string
+  imageAttachment?: string // filename or identifier of an instruction image to insert
+  imageCaption?: string
+  replaceImage?: boolean // when true, replaces the existing image in this paragraph with the uploaded screenshot
 }
 
 function normalizeReleaseNotesEdits(edits: EditOperation[]) {
@@ -296,13 +300,16 @@ export async function retrieveRelevantChunks(
 
 /**
  * Prompt-driven step 2: asks GPT-5 to turn the story, screenshot findings,
- * and retrieved manual context into minimal structured edit operations.
+ * optional further instructions, and retrieved manual context into minimal structured edit operations.
  */
 export async function planEdits(
   client: OpenAI,
   storyText: string,
   screenshotSummary: ScreenshotSummary,
   relevantParagraphs: ParagraphRecord[],
+  additionalInstructions: string = '',
+  attachedImageNames: string[] = [],
+  replaceScreenshotInManual: boolean = false,
 ): Promise<EditOperation[]> {
   const manualContext = relevantParagraphs
     .map(
@@ -313,6 +320,7 @@ export async function planEdits(
           sectionHeading: paragraph.sectionHeading,
           styleId: paragraph.styleId,
           text: paragraph.text,
+          ...(paragraph.hasImage ? { hasImage: true } : {}),
         }),
     )
     .join('\n')
@@ -321,18 +329,66 @@ export async function planEdits(
     promptVersion: EDIT_PROMPT_VERSION,
     storyText: storyText.replace(/\r\n/g, '\n').trim(),
     screenshotSummary,
+    additionalInstructions: additionalInstructions.replace(/\r\n/g, '\n').trim(),
+    attachedImageNames,
+    replaceScreenshotInManual,
     relevantParagraphs: relevantParagraphs.map((paragraph) => ({
       index: paragraph.index,
       text: paragraph.text,
       styleId: paragraph.styleId,
       pageNumber: paragraph.pageNumber,
       sectionHeading: paragraph.sectionHeading,
+      hasImage: paragraph.hasImage,
     })),
   })
   const cached = await readCache<EditOperation[]>('edit-planning', cacheKey)
   if (cached) {
     return cached
   }
+
+  const promptUserLines = [
+    'User story input:',
+    storyText.slice(0, 12000),
+    '',
+    'Screenshot summary:',
+    JSON.stringify(screenshotSummary),
+  ]
+
+  if (replaceScreenshotInManual) {
+    promptUserLines.push(
+      '',
+      'IMAGE REPLACEMENT REQUESTED:',
+      'The user has enabled the option to replace the existing image in the user manual with the uploaded screenshot.',
+      'Identify the relevant paragraph in the affected manual section that represents the existing UI screenshot / illustration (paragraphs with hasImage: true, or immediately preceding/succeeding the changed feature steps).',
+      'Include an edit targeting that paragraphIndex with "type": "replace", "replaceImage": true, and "reason": "Replace existing manual image with the uploaded updated screenshot".',
+      'If the paragraph contains no text (e.g. it is just an image paragraph), replacementText can be empty or keep the caption.',
+    )
+  }
+
+  if (additionalInstructions.trim()) {
+    promptUserLines.push(
+      '',
+      'Additional instructions / manual changes requested by user:',
+      additionalInstructions.trim(),
+    )
+  }
+
+  if (attachedImageNames.length > 0) {
+    promptUserLines.push(
+      '',
+      'Attached instruction images available to insert into the user manual:',
+      attachedImageNames.map((name) => `- ${name}`).join('\n'),
+      'If the user instructions indicate to include or place any of these images, set "imageAttachment": "<filename>" (and optional "imageCaption") on the relevant edit operation where it should be inserted or accompanied.',
+    )
+  }
+
+  promptUserLines.push(
+    '',
+    'Relevant manual paragraphs:',
+    manualContext,
+    '',
+    'Return JSON in the form {"edits":[...]} and keep unchanged paragraphs out of the result.',
+  )
 
   const response = await client.responses.create({
     model: getOpenAiModel(),
@@ -346,8 +402,11 @@ export async function planEdits(
               'You update a fixed-format user manual.',
               'Return JSON only with an edits array.',
               'Each edit must contain type, paragraphIndex, replacementText, and reason.',
+              'Optional fields: replaceImage (boolean - replace existing image with uploaded screenshot), imageAttachment (exact filename of attached image to insert), imageCaption.',
               'Allowed types are replace and insert_after.',
-              'Only propose minimal changes needed for the new story and screenshot.',
+              'Propose necessary changes needed for the new story, screenshot, and any user-specified additional instructions.',
+              'Follow all additional instructions or manual modifications provided by the user carefully and reflect them accurately in the updated user manual.',
+              'If the user requested image replacement, include an edit with replaceImage: true on the target image paragraph.',
               'Target the operational manual section that describes the affected screen or workflow.',
               'Do not edit cover pages, document metadata, release notes, or table-of-contents entries unless the user explicitly requests that exact change.',
               'Do not mention JSON fences or markdown.',
@@ -360,18 +419,7 @@ export async function planEdits(
         content: [
           {
             type: 'input_text',
-            text: [
-              'User story input:',
-              storyText.slice(0, 12000),
-              '',
-              'Screenshot summary:',
-              JSON.stringify(screenshotSummary),
-              '',
-              'Relevant manual paragraphs:',
-              manualContext,
-              '',
-              'Return JSON in the form {"edits":[...]} and keep unchanged paragraphs out of the result.',
-            ].join('\n'),
+            text: promptUserLines.join('\n'),
           },
         ],
       },
@@ -382,7 +430,9 @@ export async function planEdits(
     edits: [],
   })
   const edits = (payload.edits ?? []).filter(
-    (edit) => Number.isInteger(edit.paragraphIndex) && !!edit.replacementText,
+    (edit) =>
+      Number.isInteger(edit.paragraphIndex) &&
+      (!!edit.replacementText || !!edit.imageAttachment || !!edit.replaceImage),
   )
   await writeCache('edit-planning', cacheKey, edits)
   return edits
@@ -397,6 +447,7 @@ export async function planReleaseNotesEdits(
   storyText: string,
   screenshotSummary: ScreenshotSummary,
   relevantParagraphs: ParagraphRecord[],
+  additionalInstructions: string = '',
 ): Promise<EditOperation[]> {
   const releaseNotesContext = relevantParagraphs
     .map(
@@ -415,6 +466,7 @@ export async function planReleaseNotesEdits(
     promptVersion: RELEASE_NOTES_EDIT_PROMPT_VERSION,
     storyText: storyText.replace(/\r\n/g, '\n').trim(),
     screenshotSummary,
+    additionalInstructions: additionalInstructions.replace(/\r\n/g, '\n').trim(),
     relevantParagraphs: relevantParagraphs.map((paragraph) => ({
       index: paragraph.index,
       text: paragraph.text,
@@ -427,6 +479,30 @@ export async function planReleaseNotesEdits(
   if (cached) {
     return normalizeReleaseNotesEdits(cached)
   }
+
+  const promptUserLines = [
+    'User story input:',
+    storyText.slice(0, 12000),
+    '',
+    'Screenshot summary:',
+    JSON.stringify(screenshotSummary),
+  ]
+
+  if (additionalInstructions.trim()) {
+    promptUserLines.push(
+      '',
+      'Additional instructions / changes requested by user:',
+      additionalInstructions.trim(),
+    )
+  }
+
+  promptUserLines.push(
+    '',
+    'Relevant release notes paragraphs:',
+    releaseNotesContext,
+    '',
+    'Return JSON in the form {"edits":[...]} and keep unchanged paragraphs out of the result.',
+  )
 
   const response = await client.responses.create({
     model: getOpenAiModel(),
@@ -441,7 +517,7 @@ export async function planReleaseNotesEdits(
               'Return JSON only with an edits array.',
               'Each edit must contain type, paragraphIndex, replacementText, and reason.',
               'Allowed types are replace and insert_after.',
-              'Add a concise user-facing release note for the supplied change.',
+              'Add a concise user-facing release note for the supplied change, taking into account any additional user instructions.',
               'Prefer insert_after near the newest relevant version, feature, or change section.',
               'When surrounding entries are bullet points, insert the new entry beside a bullet paragraph so its bullet formatting is reused.',
               'Write only the release-note content; never prefix it with New:, (New:), (New), or a similar label.',
@@ -457,18 +533,7 @@ export async function planReleaseNotesEdits(
         content: [
           {
             type: 'input_text',
-            text: [
-              'User story input:',
-              storyText.slice(0, 12000),
-              '',
-              'Screenshot summary:',
-              JSON.stringify(screenshotSummary),
-              '',
-              'Relevant release notes paragraphs:',
-              releaseNotesContext,
-              '',
-              'Return JSON in the form {"edits":[...]} and keep unchanged paragraphs out of the result.',
-            ].join('\n'),
+            text: promptUserLines.join('\n'),
           },
         ],
       },

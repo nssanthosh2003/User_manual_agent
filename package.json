@@ -19,7 +19,7 @@
     "express": "^5.3.0",
     "mammoth": "^1.13.0",
     "multer": "^2.4.0",
-    "openai": "^7.32.0",
+    "openai": "^7.39.0",
     "pizzip": "^3.3.0",
     "react": "^19.2.8",
     "react-dom": "^19.2.8",
@@ -40,5 +40,8 @@
     "tsx": "^4.23.15",
     "typescript": "~6.0.2",
     "vite": "^8.3.0"
+  },
+  "optionalDependencies": {
+    "@rolldown/binding-win32-x64-msvc": "^1.2.14"
   }
 }

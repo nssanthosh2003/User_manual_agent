@@ -30,6 +30,9 @@ type AppliedEdit = {
   oldText: string
   newText: string
   reason: string
+  imageAttachment?: string
+  imageCaption?: string
+  replaceImage?: boolean
 }
 
 type ProcessResult = {
@@ -37,6 +40,9 @@ type ProcessResult = {
   outputUrl: string
   generatedAt: string
   storyExcerpt: string
+  additionalInstructions?: string | null
+  attachedImageCount?: number
+  replaceScreenshotRequested?: boolean
   screenshotSummary: {
     summary: string
     visibleChanges: string[]
@@ -62,6 +68,9 @@ function App() {
   const [storyFile, setStoryFile] = useState<File | null>(null)
   const [screenshotFile, setScreenshotFile] = useState<File | null>(null)
   const [screenshotDescription, setScreenshotDescription] = useState('')
+  const [replaceScreenshotInManual, setReplaceScreenshotInManual] = useState(false)
+  const [additionalInstructions, setAdditionalInstructions] = useState('')
+  const [instructionImages, setInstructionImages] = useState<File[]>([])
   const [updateIndex, setUpdateIndex] = useState(true)
   const [isSubmitting, setIsSubmitting] = useState(false)
   const [deletingManual, setDeletingManual] = useState('')
@@ -106,6 +115,11 @@ function App() {
     formData.append('userStory', storyFile)
     formData.append('screenshot', screenshotFile)
     formData.append('screenshotDescription', screenshotDescription)
+    formData.append('replaceScreenshotInManual', String(replaceScreenshotInManual))
+    formData.append('additionalInstructions', additionalInstructions)
+    for (const imageFile of instructionImages) {
+      formData.append('instructionImages', imageFile)
+    }
     formData.append('updateIndex', String(updateIndex))
 
     setIsSubmitting(true)
@@ -188,15 +202,37 @@ function App() {
             <small>{storyFile ? storyFile.name : 'Upload the refined user story file in Excel or document format.'}</small>
           </label>
 
-          <label className="input-card">
-            <span>Change screenshot</span>
+          <div className="input-card screenshot-card-group">
+            <span className="input-title-with-badge">
+              <span>Change screenshot</span>
+              <span className="required-badge">Required</span>
+            </span>
             <input
               type="file"
               accept="image/png,image/jpeg,image/webp"
               onChange={(event) => setScreenshotFile(event.target.files?.[0] ?? null)}
             />
             <small>{screenshotFile ? screenshotFile.name : 'Upload the screenshot that contains the UI change.'}</small>
-          </label>
+
+            <div className="screenshot-toggle-row">
+              <label className="toggle-switch">
+                <input
+                  type="checkbox"
+                  checked={replaceScreenshotInManual}
+                  onChange={(event) => setReplaceScreenshotInManual(event.target.checked)}
+                />
+                <span className="toggle-slider"></span>
+              </label>
+              <div className="toggle-label-text">
+                <strong>Replace existing image in manual</strong>
+                <small>
+                  {replaceScreenshotInManual
+                    ? 'Active: The uploaded screenshot will replace the matching UI screenshot in the manual.'
+                    : 'Inactive: The screenshot is only analyzed for text updates; existing manual images remain unchanged.'}
+                </small>
+              </div>
+            </div>
+          </div>
 
           <label className="input-card">
             <span>Screenshot change description</span>
@@ -208,6 +244,61 @@ function App() {
             />
             <small>This context is combined with the screenshot analysis to produce a precise update.</small>
           </label>
+
+          <div className="input-card instruction-card-group">
+            <span className="input-title-with-badge">
+              <span>Further instructions / additional changes</span>
+              <em className="optional-badge">Optional</em>
+            </span>
+            <textarea
+              value={additionalInstructions}
+              onChange={(event) => setAdditionalInstructions(event.target.value)}
+              placeholder="Add any specific guidelines, extra sections/paragraphs to add, custom wording, or instructions on where to include additional images..."
+              rows={4}
+            />
+            <small>Provide custom instructions or additional modifications to incorporate into the updated manual beyond standard story/screenshot extraction.</small>
+
+            <div className="nested-image-upload">
+              <div className="nested-image-header">
+                <strong>Additional images (single or multiple)</strong>
+                <span className="optional-badge">Optional</span>
+              </div>
+              <input
+                type="file"
+                multiple
+                accept="image/png,image/jpeg,image/webp"
+                id="instruction-images-input"
+                onChange={(event) => {
+                  if (event.target.files) {
+                    const newFiles = Array.from(event.target.files)
+                    setInstructionImages((prev) => [...prev, ...newFiles])
+                    event.target.value = ''
+                  }
+                }}
+              />
+              <small>Upload one or more reference images, diagrams, or UI captures to insert into the manual as instructed above.</small>
+
+              {instructionImages.length > 0 ? (
+                <div className="image-tag-list">
+                  {instructionImages.map((file, idx) => (
+                    <span key={`${file.name}-${idx}`} className="image-tag">
+                      <span className="image-name">{file.name}</span>
+                      <button
+                        type="button"
+                        className="remove-image-btn"
+                        onClick={() =>
+                          setInstructionImages((prev) => prev.filter((_, i) => i !== idx))
+                        }
+                        title="Remove image"
+                      >
+                        ✕
+                      </button>
+                    </span>
+                  ))}
+                </div>
+              ) : null}
+            </div>
+          </div>
 
           <label className="index-option">
             <input
@@ -349,6 +440,24 @@ function App() {
                 <p>{deferredResult.storyExcerpt}</p>
               </article>
 
+              {deferredResult.additionalInstructions || deferredResult.attachedImageCount ? (
+                <article className="result-card">
+                  <div className="section-title-badge-row">
+                    <h3>Further instructions applied</h3>
+                    <span className="status-chip-subtle">
+                      {deferredResult.attachedImageCount
+                        ? `${deferredResult.attachedImageCount} image(s) attached`
+                        : 'User specified'}
+                    </span>
+                  </div>
+                  {deferredResult.additionalInstructions ? (
+                    <p className="pre-wrapped-text">{deferredResult.additionalInstructions}</p>
+                  ) : (
+                    <p className="muted-text">Images provided with update request.</p>
+                  )}
+                </article>
+              ) : null}
+
               <article className="result-card">
                 <h3>Screenshot summary</h3>
                 <p>{deferredResult.screenshotSummary.summary}</p>
@@ -383,6 +492,17 @@ function App() {
                         <strong>Word page {edit.pageNumber}</strong>
                         <span>Section: {edit.sectionHeading}</span>
                       </div>
+                      {edit.replaceImage ? (
+                        <div className="image-edit-badge replace-image-badge">
+                          <span>🔄 <strong>Replaced manual image</strong> with uploaded screenshot</span>
+                        </div>
+                      ) : null}
+                      {edit.imageAttachment ? (
+                        <div className="image-edit-badge">
+                          <span>📷 Inserted image: <strong>{edit.imageAttachment}</strong></span>
+                          {edit.imageCaption ? <small>Caption: {edit.imageCaption}</small> : null}
+                        </div>
+                      ) : null}
                       <p className="edit-reason">{edit.reason}</p>
                       <div className="comparison-grid">
                         <div className="comparison-old">
