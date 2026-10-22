@@ -3,10 +3,10 @@ import fs from 'node:fs/promises'
 import path from 'node:path'
 import OpenAI from 'openai'
 
-const CACHE_SCHEMA_VERSION = 1
-const SCREENSHOT_PROMPT_VERSION = 'screenshot-analysis-v1'
-const EDIT_PROMPT_VERSION = 'edit-planning-v1'
-const RELEASE_NOTES_EDIT_PROMPT_VERSION = 'release-notes-edit-planning-v2'
+const CACHE_SCHEMA_VERSION = 2
+const SCREENSHOT_PROMPT_VERSION = 'screenshot-analysis-v2'
+const EDIT_PROMPT_VERSION = 'edit-planning-v2'
+const RELEASE_NOTES_EDIT_PROMPT_VERSION = 'release-notes-edit-planning-v3'
 const agentCacheDir = path.join(process.cwd(), 'storage', 'agent-cache')
 
 /** A paragraph plus its human-readable location in the source manual. */
@@ -207,7 +207,17 @@ export async function analyzeScreenshot(
         content: [
           {
             type: 'input_text',
-            text: 'You extract UI change requirements from screenshots for a documentation update workflow. Return JSON only.',
+            text: [
+              'You are an expert technical writer and UI analyst specializing in software user manuals.',
+              'Your job is to thoroughly analyze the provided UI screenshot alongside the user description to identify EXACTLY what changed, where it appears in the workflow, and which screens, sections, buttons, fields, or tabs are affected.',
+              'Return JSON only with keys: summary, visibleChanges, extractedText, impacts.',
+              'CRITICAL INSTRUCTIONS:',
+              '1. Carefully examine and cross-reference the user description with the screenshot visual elements.',
+              '2. In "summary": State clearly what screen/feature is shown, what changed, and where it lives in the application flow.',
+              '3. In "visibleChanges": List specific UI differences, new or modified buttons, input fields, labels, headers, toggles, or layout changes.',
+              '4. In "extractedText": Extract exact literal text labels, titles, button captions, dropdown options, and heading texts visible in the changed area of the screenshot.',
+              '5. In "impacts": Identify the specific user actions, workflow steps, or operational manual sections affected by this change.',
+            ].join(' '),
           },
         ],
       },
@@ -217,11 +227,10 @@ export async function analyzeScreenshot(
           {
             type: 'input_text',
             text: [
-              'Analyze the screenshot and identify the UI changes that must be reflected in the user manual.',
-              `User-provided screenshot description: ${screenshotDescription || 'No description provided.'}`,
-              'Return JSON with keys: summary, visibleChanges, extractedText, impacts.',
-              'The summary must be one short string. Each list should contain only short, necessary items.',
-            ].join(' '),
+              'Analyze this screenshot and match it with the user description for a precise manual update.',
+              `User Description of Change: ${screenshotDescription || 'No description provided.'}`,
+              'Return strictly valid JSON with keys: summary, visibleChanges, extractedText, impacts.',
+            ].join('\n'),
           },
           {
             type: 'input_image',
@@ -244,57 +253,89 @@ export async function analyzeScreenshot(
   return summary
 }
 
-function cosineSimilarity(left: number[], right: number[]) {
-  let dot = 0
-  let leftMagnitude = 0
-  let rightMagnitude = 0
-
-  for (let index = 0; index < left.length; index += 1) {
-    dot += left[index] * right[index]
-    leftMagnitude += left[index] * left[index]
-    rightMagnitude += right[index] * right[index]
-  }
-
-  return dot / (Math.sqrt(leftMagnitude) * Math.sqrt(rightMagnitude))
-}
-
-function buildTermVector(value: string, vocabulary: string[]) {
-  const terms = value.toLowerCase().match(/[a-z0-9]{2,}/g) ?? []
-  const counts = new Map<string, number>()
-  for (const term of terms) {
-    counts.set(term, (counts.get(term) ?? 0) + 1)
-  }
-
-  return vocabulary.map((term) => counts.get(term) ?? 0)
+function tokenize(text: string): string[] {
+  return (
+    text
+      .toLowerCase()
+      .replace(/[^a-z0-9_\-\s]/g, ' ')
+      .match(/[a-z0-9_\-]{2,}/g) ?? []
+  )
 }
 
 /**
- * Retrieval step: ranks manual chunks locally using term-frequency vectors.
- * The client parameter is retained to keep the workflow's existing interface.
+ * Enhanced retrieval step: scores manual chunks using BM25-style term frequency,
+ * inverse document frequency, and section heading boosting.
  */
 export async function retrieveRelevantChunks(
   _client: OpenAI,
   query: string,
   chunks: ManualChunk[],
 ) {
-  const vocabulary = [
-    ...new Set(
-      [query, ...chunks.map((chunk) => chunk.content)]
-        .join(' ')
-        .toLowerCase()
-        .match(/[a-z0-9]{2,}/g) ?? [],
-    ),
-  ]
-  const queryVector = buildTermVector(query, vocabulary)
-  const scored = chunks.map((chunk, order) => ({
-    chunk,
-    order,
-    score: cosineSimilarity(queryVector, buildTermVector(chunk.content, vocabulary)),
-  }))
+  const queryTokens = tokenize(query)
+  if (queryTokens.length === 0 || chunks.length === 0) {
+    return chunks.slice(0, 8)
+  }
 
+  const N = chunks.length
+  // Document frequencies for query terms
+  const docFrequencies = new Map<string, number>()
+  const chunkTokenSets = chunks.map((c) => {
+    const tokens = new Set(tokenize(c.content))
+    for (const token of tokens) {
+      docFrequencies.set(token, (docFrequencies.get(token) ?? 0) + 1)
+    }
+    return tokens
+  })
+
+  // Average document length in tokens
+  const chunkLengths = chunks.map((c) => tokenize(c.content).length)
+  const avgDl = chunkLengths.reduce((a, b) => a + b, 0) / (N || 1)
+  const k1 = 1.2
+  const b = 0.75
+
+  const scored = chunks.map((chunk, index) => {
+    const chunkTokens = tokenize(chunk.content)
+    const tokenCounts = new Map<string, number>()
+    for (const t of chunkTokens) {
+      tokenCounts.set(t, (tokenCounts.get(t) ?? 0) + 1)
+    }
+
+    const headingTokens = new Set(tokenize(chunk.sectionHeadings.join(' ')))
+    let bm25Score = 0
+
+    for (const qTerm of queryTokens) {
+      const f = tokenCounts.get(qTerm) ?? 0
+      if (f > 0) {
+        const df = docFrequencies.get(qTerm) ?? 1
+        const idf = Math.log(1 + (N - df + 0.5) / (df + 0.5))
+        const tfComponent = (f * (k1 + 1)) / (f + k1 * (1 - b + b * (chunkLengths[index] / (avgDl || 1))))
+        let weight = idf * tfComponent
+
+        // Boost matches occurring in section headings
+        if (headingTokens.has(qTerm)) {
+          weight *= 2.5
+        }
+
+        bm25Score += weight
+      }
+    }
+
+    // Boost chunks that have image illustrations if screenshot replacement was requested or mentioned
+    if (chunk.content.includes('[IMAGE / SCREENSHOT ILLUSTRATION]')) {
+      bm25Score *= 1.25
+    }
+
+    return {
+      chunk,
+      index,
+      score: bm25Score,
+    }
+  })
+
+  // Return top 8 most relevant chunks to provide comprehensive context to GPT
   return scored
-    .sort((left, right) => right.score - left.score || left.order - right.order)
-    .slice(0, 5)
+    .sort((left, right) => right.score - left.score || left.index - right.index)
+    .slice(0, 8)
     .map(({ chunk }) => chunk)
 }
 
@@ -399,18 +440,22 @@ export async function planEdits(
           {
             type: 'input_text',
             text: [
-              'You update a fixed-format user manual.',
-              'Return JSON only with an edits array.',
-              'Each edit must contain type, paragraphIndex, replacementText, and reason.',
-              'Optional fields: replaceImage (boolean - replace existing image with uploaded screenshot), imageAttachment (exact filename of attached image to insert), imageCaption.',
-              'Allowed types are replace and insert_after.',
-              'Propose necessary changes needed for the new story, screenshot, and any user-specified additional instructions.',
-              'Follow all additional instructions or manual modifications provided by the user carefully and reflect them accurately in the updated user manual.',
-              'If the user requested image replacement, include an edit with replaceImage: true on the target image paragraph.',
-              'Target the operational manual section that describes the affected screen or workflow.',
-              'Do not edit cover pages, document metadata, release notes, or table-of-contents entries unless the user explicitly requests that exact change.',
-              'Do not mention JSON fences or markdown.',
-            ].join(' '),
+              'You are an expert technical documentation editor updating a fixed-format user manual DOCX.',
+              'Your job is to update the manual at the EXACT correct place matching the user story, screenshot analysis, and user-provided description.',
+              'Return JSON only with an edits array: {"edits": [...]}.',
+              'Each edit must contain: type ("replace" | "insert_after"), paragraphIndex (number), replacementText (string), and reason (string).',
+              'Optional fields: replaceImage (boolean - true when replacing the existing manual screenshot/illustration with the newly uploaded screenshot), imageAttachment (exact filename of attached image), imageCaption.',
+              '',
+              'CRITICAL RULES FOR SELECTING THE CORRECT EDIT LOCATION:',
+              '1. TARGET OPERATIONAL SECTIONS: Carefully inspect the "sectionHeading" of the candidate paragraphs. The operational manual sections describe specific user workflows, feature screens, and UI steps (e.g. "Create Order", "Review Offers", "Passenger Details", "Payment", etc.).',
+              '2. NEVER edit preface, document control, revision history tables, table of contents, executive summary, or document introduction unless the user explicitly requested changes to document metadata.',
+              '3. MATCH SCREENSHOT & DESCRIPTION: Analyze the screenshotSummary (extracted UI elements, screen name, buttons, labels) and the user\'s screenshot description. Locate the exact paragraph(s) in the manual that describe this specific screen, form field, button, or procedure.',
+              '4. PRESERVE SURROUNDING CONTEXT: Keep the voice, bullet style, numbering, and structure of the manual intact. Do not rewrite unaffected steps.',
+              '5. IMAGE REPLACEMENT ACCURACY: If replaceScreenshotInManual is true, identify the EXACT illustration/image paragraph (hasImage: true) that belongs to this specific feature screen in the operational section. Propose an edit with type: "replace", replaceImage: true on that specific paragraphIndex.',
+              '6. ATTACHED IMAGES: If the user specified instructions to place an attached image, insert it directly following the relevant explanatory paragraph.',
+              '7. Keep unchanged paragraphs out of the edits array.',
+              '8. Do not output markdown code fences or conversational text.',
+            ].join('\n'),
           },
         ],
       },

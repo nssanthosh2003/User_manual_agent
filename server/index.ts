@@ -325,17 +325,19 @@ function buildChunks(paragraphs: ParagraphRecord[]): ManualChunk[] {
     if (records.length === 0) {
       return
     }
+    const sectionHeadings = [...new Set(records.map((p) => p.sectionHeading).filter(Boolean))]
     chunks.push({
       id: `chunk-${chunks.length + 1}`,
       paragraphIndices: records.map((paragraph) => paragraph.index),
       pageNumbers: [...new Set(records.map((paragraph) => paragraph.pageNumber))],
-      sectionHeadings: [...new Set(records.map((paragraph) => paragraph.sectionHeading))],
-      content: records
-        .map(
-          (paragraph) =>
-            `Page ${paragraph.pageNumber}, section "${paragraph.sectionHeading}": ${paragraph.text}`,
-        )
-        .join('\n'),
+      sectionHeadings,
+      content: [
+        `Sections: ${sectionHeadings.join(' > ')}`,
+        ...records.map((paragraph) => {
+          const imageTag = paragraph.hasImage ? ' [IMAGE / SCREENSHOT ILLUSTRATION]' : ''
+          return `[P#${paragraph.index} | Page ${paragraph.pageNumber} | ${paragraph.sectionHeading}]${imageTag} ${paragraph.text || '(Image Figure)'}`
+        }),
+      ].join('\n'),
     })
   }
 
@@ -343,10 +345,10 @@ function buildChunks(paragraphs: ParagraphRecord[]): ManualChunk[] {
     const previous = slice.at(-1)
     const boundaryChanged =
       previous &&
-      (previous.pageNumber !== paragraph.pageNumber ||
-        previous.sectionHeading !== paragraph.sectionHeading)
+      (previous.sectionHeading !== paragraph.sectionHeading ||
+        Math.abs(previous.pageNumber - paragraph.pageNumber) > 1)
 
-    if (slice.length >= 5 || boundaryChanged) {
+    if (slice.length >= 8 || boundaryChanged) {
       addChunk(slice)
       slice = []
     }
@@ -973,15 +975,20 @@ app.post(
       const paragraphs = await extractParagraphsFromDocx(baseManual.path)
       const chunks = buildChunks(paragraphs)
       const retrievalQuery = [
-        storyText,
-        screenshotDescription,
-        additionalInstructions,
-        ...instructionImageFiles.map((f) => f.originalname),
-        screenshotSummary.summary,
-        ...screenshotSummary.visibleChanges,
-        ...screenshotSummary.impacts,
+        screenshotDescription ? `Screenshot Description: ${screenshotDescription}` : '',
+        additionalInstructions ? `User Modification Instructions: ${additionalInstructions}` : '',
+        screenshotSummary.summary ? `Screenshot Screen Summary: ${screenshotSummary.summary}` : '',
+        screenshotSummary.visibleChanges.length > 0
+          ? `Visible UI Elements & Changes: ${screenshotSummary.visibleChanges.join('; ')}`
+          : '',
+        screenshotSummary.impacts.length > 0
+          ? `Impacts & Actions: ${screenshotSummary.impacts.join('; ')}`
+          : '',
+        ...instructionImageFiles.map((f) => `Attached Image: ${f.originalname}`),
+        `User Story Context: ${storyText.slice(0, 3000)}`,
       ]
-        .join('\n')
+        .filter(Boolean)
+        .join('\n\n')
         .slice(0, 12000)
       const retrievedChunks = await retrieveRelevantChunks(client, retrievalQuery, chunks)
       const paragraphIndices = new Set(retrievedChunks.flatMap((chunk) => chunk.paragraphIndices))
