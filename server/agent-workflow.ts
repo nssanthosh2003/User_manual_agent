@@ -3,9 +3,9 @@ import fs from 'node:fs/promises'
 import path from 'node:path'
 import OpenAI from 'openai'
 
-const CACHE_SCHEMA_VERSION = 2
+const CACHE_SCHEMA_VERSION = 3
 const SCREENSHOT_PROMPT_VERSION = 'screenshot-analysis-v2'
-const EDIT_PROMPT_VERSION = 'edit-planning-v2'
+const EDIT_PROMPT_VERSION = 'edit-planning-v3'
 const RELEASE_NOTES_EDIT_PROMPT_VERSION = 'release-notes-edit-planning-v3'
 const agentCacheDir = path.join(process.cwd(), 'storage', 'agent-cache')
 
@@ -325,6 +325,15 @@ export async function retrieveRelevantChunks(
       bm25Score *= 1.25
     }
 
+    // Penalize high-level overview bullet lists that merely cross-reference sections (e.g. "See Section X.Y")
+    // so that the retriever prefers the detailed operational section body
+    if (
+      chunk.content.includes('See Section') ||
+      chunk.content.includes('Steps to create order')
+    ) {
+      bm25Score *= 0.35
+    }
+
     return {
       chunk,
       index,
@@ -332,10 +341,10 @@ export async function retrieveRelevantChunks(
     }
   })
 
-  // Return top 8 most relevant chunks to provide comprehensive context to GPT
+  // Return top 10 most relevant chunks to provide comprehensive context to GPT
   return scored
     .sort((left, right) => right.score - left.score || left.index - right.index)
-    .slice(0, 8)
+    .slice(0, 10)
     .map(({ chunk }) => chunk)
 }
 
@@ -447,12 +456,14 @@ export async function planEdits(
               'Optional fields: replaceImage (boolean - true when replacing the existing manual screenshot/illustration with the newly uploaded screenshot), imageAttachment (exact filename of attached image), imageCaption.',
               '',
               'CRITICAL RULES FOR SELECTING THE CORRECT EDIT LOCATION:',
-              '1. TARGET OPERATIONAL SECTIONS: Carefully inspect the "sectionHeading" of the candidate paragraphs. The operational manual sections describe specific user workflows, feature screens, and UI steps (e.g. "Create Order", "Review Offers", "Passenger Details", "Payment", etc.).',
-              '2. NEVER edit preface, document control, revision history tables, table of contents, executive summary, or document introduction unless the user explicitly requested changes to document metadata.',
-              '3. MATCH SCREENSHOT & DESCRIPTION: Analyze the screenshotSummary (extracted UI elements, screen name, buttons, labels) and the user\'s screenshot description. Locate the exact paragraph(s) in the manual that describe this specific screen, form field, button, or procedure.',
+              '1. TARGET DETAILED OPERATIONAL SECTIONS: The edits MUST be made inside the actual detailed operational section body that explains the feature, screen overview, UI controls, and procedure (e.g., Section 3.7 "Seats and Services Selection", "Seats Selection", "Screen Overview", Section 3.4 "Review Offers", Section 3.6 "Passenger Details").',
+              '2. STRICTLY FORBIDDEN LOCATIONS: NEVER propose edits in:',
+              '   a) High-level overview step summaries or roadmap outlines (e.g., "Steps to create order", or paragraphs that say "See Section 3.X ..."). Those are high-level table-like step lists, NOT the operational section body.',
+              '   b) Preface, document control, revision history tables, executive summary, or table of contents.',
+              '3. MATCH SCREENSHOT & DESCRIPTION: Analyze the screenshotSummary (extracted UI elements, screen name, buttons, labels) and the user\'s screenshot description. Locate the exact paragraph(s) in the detailed operational section that describe this specific screen, form field, button, or procedure.',
               '4. PRESERVE SURROUNDING CONTEXT: Keep the voice, bullet style, numbering, and structure of the manual intact. Do not rewrite unaffected steps.',
               '5. IMAGE REPLACEMENT ACCURACY: If replaceScreenshotInManual is true, identify the EXACT illustration/image paragraph (hasImage: true) that belongs to this specific feature screen in the operational section. Propose an edit with type: "replace", replaceImage: true on that specific paragraphIndex.',
-              '6. ATTACHED IMAGES: If the user specified instructions to place an attached image, insert it directly following the relevant explanatory paragraph.',
+              '6. ATTACHED IMAGES: If the user specified instructions to place an attached image, insert it directly following the relevant explanatory paragraph in the detailed operational section.',
               '7. Keep unchanged paragraphs out of the edits array.',
               '8. Do not output markdown code fences or conversational text.',
             ].join('\n'),
