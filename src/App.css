@@ -26,6 +26,19 @@
   color: var(--accent);
 }
 
+.hero-copy {
+  max-width: 780px;
+  font-size: 1.08rem;
+}
+
+.hero-metrics {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 16px;
+  margin-top: 32px;
+}
+
+.hero-metrics article,
 .panel,
 .input-card,
 .workflow-strip article,
@@ -39,11 +52,23 @@
   backdrop-filter: blur(14px);
 }
 
+.hero-metrics article {
+  border-radius: 20px;
+  padding: 18px 20px;
+}
+
+.hero-metrics span,
 .manual-card p,
 .result-summary p,
 .chunk-card span,
 .input-card small {
   color: var(--muted);
+}
+
+.hero-metrics strong {
+  display: block;
+  margin-top: 8px;
+  color: var(--heading-color);
 }
 
 .grid-layout {

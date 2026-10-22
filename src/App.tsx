@@ -179,7 +179,28 @@ function App() {
   return (
     <main className="shell">
       <section className="hero-panel">
+        <p className="eyebrow">Agentic workflow + RAG manual updater</p>
         <h1>TCS AgentAssist Manual Updater</h1>
+        <p className="hero-copy">
+          Keep the approved DOCX manual fixed as the knowledge base, submit a user story file and a
+          screenshot, and generate an updated manual in a separate output folder without disturbing
+          the original source manual.
+        </p>
+
+        <div className="hero-metrics">
+          <article>
+            <span>Vision model</span>
+            <strong>GPT-5</strong>
+          </article>
+          <article>
+            <span>Knowledge source</span>
+            <strong>{workspaceState.knowledgeBaseManuals.length || 0} fixed manuals</strong>
+          </article>
+          <article>
+            <span>Generated outputs</span>
+            <strong>{workspaceState.updatedManuals.length || 0} manuals</strong>
+          </article>
+        </div>
       </section>
 
       <section className="grid-layout">
