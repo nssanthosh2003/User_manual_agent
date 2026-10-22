@@ -336,15 +336,15 @@ function App() {
           <div className="workflow-strip">
             <article>
               <strong>1</strong>
-              <p>Analyze inputs.</p>
+              <p>Extract story text and analyze the screenshot with vision.</p>
             </article>
             <article>
               <strong>2</strong>
-              <p>Find relevant sections.</p>
+              <p>Retrieve relevant manual paragraphs through BM25 RAG.</p>
             </article>
             <article>
               <strong>3</strong>
-              <p>Generate both documents.</p>
+              <p>Apply targeted DOCX edits and generate updated documents.</p>
             </article>
           </div>
 
